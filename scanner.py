@@ -10,7 +10,7 @@ class AsyncWebScanner:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0"
         }
         
-    def detect_cms(self, html, headers):
+    def detect_cms(self, html, headers, cookies_str=""):
         soup = BeautifulSoup(html, 'html.parser')
         generator = soup.find('meta', attrs={'name': 'generator'})
         gen_content = generator.get('content', '').lower() if generator else ''
@@ -21,13 +21,20 @@ class AsyncWebScanner:
             
         # 2. Drupal
         headers_str = str(headers).lower()
+        html_lower = html.lower()
         if 'drupal' in gen_content or 'x-generator' in headers_str and 'drupal' in headers_str:
             return "Drupal"
-        if '/sites/default/files' in html or 'data-drupal-selector' in html:
+        if '/sites/default/files' in html or 'data-drupal-selector' in html or 'drupal.settings' in html_lower or 'drupal.behaviors' in html_lower:
+            return "Drupal"
+        if 'x-drupal-cache' in headers_str or 'x-drupal-dynamic-cache' in headers_str:
+            return "Drupal"
+        if 'drupalsettings' in html_lower or '/core/misc/drupal.js' in html_lower or 'jquery.once.js' in html_lower:
+            return "Drupal"
+        if 'ssess' in cookies_str or 'sess' in cookies_str and ('drupal' in html_lower or 'sites/default' in html_lower):
             return "Drupal"
             
         # 3. Moodle
-        if 'moodle' in gen_content or '/theme/image.php' in html or 'moodlesession' in headers_str:
+        if 'moodle' in gen_content or '/theme/image.php' in html or 'moodlesession' in headers_str or 'moodlesession' in cookies_str or 'var moodleconfig' in html_lower or 'm.yui' in html_lower:
             return "Moodle"
             
         # 4. Astro
@@ -101,20 +108,25 @@ class AsyncWebScanner:
 
     async def run_passive_scan(self, session):
         try:
-            async with session.get(self.url, headers=self.headers, timeout=10, ssl=False) as response:
+            async with session.get(self.url, headers=self.headers, timeout=45, ssl=False) as response:
                 html = await response.text()
-                headers = dict(response.headers)
+                # Recopilamos headers de toda la cadena de redirecciones
+                all_headers = dict(response.headers)
+                for r in response.history:
+                    all_headers.update(dict(r.headers))
                 
-                # Simulamos pequeños retrasos para que la UI marque la checklist
-                await asyncio.sleep(0.5) 
+                # Recopilamos las cookies del session jar
+                cookies_str = ""
+                if session.cookie_jar:
+                    cookies_str = str(session.cookie_jar).lower()
                 
-                cms = self.detect_cms(html, headers)
+                cms = self.detect_cms(html, all_headers, cookies_str)
                 
                 return {
                     "status": "success",
                     "target": self.url,
                     "cms_info": cms,
-                    "header_issues": self.scan_headers(headers),
+                    "header_issues": self.scan_headers(all_headers),
                     "ecosystem": self.analyze_ecosystem(html, cms),
                     "malware": self.analyze_html_for_malware(html),
                     "audit": self.run_passive_audit(html)

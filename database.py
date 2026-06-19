@@ -19,6 +19,23 @@ class Website(Base):
     last_scan_result = Column(String, default=None, nullable=True) # Stored as JSON string
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class IncidentLog(Base):
+    __tablename__ = "incident_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    website_id = Column(Integer, index=True, nullable=False)
+    incident_type = Column(String, nullable=False) # e.g. "UPTIME_DOWN", "UPTIME_UP", "SCAN_ERROR"
+    message = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PingHistory(Base):
+    __tablename__ = "ping_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    website_id = Column(Integer, index=True, nullable=False)
+    response_time_ms = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
