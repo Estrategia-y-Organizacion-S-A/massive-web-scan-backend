@@ -101,7 +101,7 @@ class AsyncWebScanner:
 
     async def run_passive_scan(self, session):
         try:
-            async with session.get(self.url, headers=self.headers, timeout=10) as response:
+            async with session.get(self.url, headers=self.headers, timeout=10, ssl=False) as response:
                 html = await response.text()
                 headers = dict(response.headers)
                 
