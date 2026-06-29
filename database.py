@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
 
 DATABASE_URL = "sqlite:///./websites.db"
 
@@ -17,7 +17,10 @@ class Website(Base):
     is_up = Column(Boolean, default=None, nullable=True)
     last_uptime_check = Column(DateTime, default=None, nullable=True)
     last_scan_result = Column(String, default=None, nullable=True) # Stored as JSON string
-    created_at = Column(DateTime, default=datetime.utcnow)
+    ssl_expiration_date = Column(DateTime, default=None, nullable=True)
+    ssl_valid = Column(Boolean, default=None, nullable=True)
+    alerts_enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class IncidentLog(Base):
     __tablename__ = "incident_logs"
@@ -26,7 +29,7 @@ class IncidentLog(Base):
     website_id = Column(Integer, index=True, nullable=False)
     incident_type = Column(String, nullable=False) # e.g. "UPTIME_DOWN", "UPTIME_UP", "SCAN_ERROR"
     message = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class PingHistory(Base):
     __tablename__ = "ping_history"
@@ -34,7 +37,7 @@ class PingHistory(Base):
     id = Column(Integer, primary_key=True, index=True)
     website_id = Column(Integer, index=True, nullable=False)
     response_time_ms = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
 def init_db():
     Base.metadata.create_all(bind=engine)

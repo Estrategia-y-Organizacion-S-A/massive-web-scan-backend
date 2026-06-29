@@ -1,17 +1,18 @@
 import asyncio
 import aiohttp
 from datetime import datetime
+from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from database import SessionLocal, Website, IncidentLog
+from database import SessionLocal, Website, IncidentLog, PingHistory, get_db
 from scanner import AsyncWebScanner
 import json
 import urllib.parse
 import platform
 import time
 import os
-import requests
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
 
 load_dotenv()
 
@@ -51,20 +52,20 @@ async def async_ping(url):
     except Exception:
         return False, 0
 
-async def check_single_uptime(session, website):
+async def check_single_uptime(website, db: Session):
     http_up = False
     latency_ms = 0
     start_time = time.time()
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with session.get(website.url, timeout=45, headers=headers, allow_redirects=True, ssl=False) as response:
-            http_up = response.status < 500
-            if http_up:
-                latency_ms = int((time.time() - start_time) * 1000)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(website.url, timeout=45, headers=headers, allow_redirects=True, ssl=False) as response:
+                http_up = response.status < 500
+                if http_up:
+                    latency_ms = int((time.time() - start_time) * 1000)
     except Exception:
         pass
         
-    # Si falla por HTTP, intentamos un ping tradicional (ICMP)
     if not http_up:
         ping_up, ping_latency = await async_ping(website.url)
         new_status = ping_up
@@ -72,91 +73,81 @@ async def check_single_uptime(session, website):
     else:
         new_status = True
         
-    incidents = []
-    if website.is_up is True and new_status is False:
+    if website.is_up in (True, None) and new_status is False:
         msg = "La web ha dejado de responder (Caída)"
-        incidents.append(IncidentLog(website_id=website.id, incident_type="UPTIME_DOWN", message=msg))
-        await send_telegram_alert(f"🚨 <b>ALERTA DE CAÍDA</b>\nLa web {website.url} no responde.")
+        db.add(IncidentLog(website_id=website.id, incident_type="UPTIME_DOWN", message=msg))
+        if website.alerts_enabled:
+            await send_telegram_alert(f"🚨 <b>ALERTA DE CAÍDA</b>\nLa web {website.url} no responde.")
     elif website.is_up is False and new_status is True:
         msg = "La web ha vuelto a responder (Recuperada)"
-        incidents.append(IncidentLog(website_id=website.id, incident_type="UPTIME_UP", message=msg))
-        await send_telegram_alert(f"✅ <b>WEB RECUPERADA</b>\nLa web {website.url} vuelve a estar operativa.")
+        db.add(IncidentLog(website_id=website.id, incident_type="UPTIME_UP", message=msg))
+        if website.alerts_enabled:
+            await send_telegram_alert(f"✅ <b>WEB RECUPERADA</b>\nLa web {website.url} vuelve a estar operativa.")
         
     website.is_up = new_status
-    website.last_uptime_check = datetime.utcnow()
+    website.last_uptime_check = datetime.now(timezone.utc)
     
-    ping_log = None
     if new_status:
-        from database import PingHistory
-        ping_log = PingHistory(website_id=website.id, response_time_ms=latency_ms)
-        
-    return incidents, ping_log
+        db.add(PingHistory(website_id=website.id, response_time_ms=latency_ms))
+    db.commit()
 
 async def check_uptimes():
-    print(f"[{datetime.utcnow()}] Running 5-min uptime check...")
-    db = SessionLocal()
-    try:
-        websites = db.query(Website).all()
-        semaphore = asyncio.Semaphore(50)
-        
-        async def sem_task(session, w):
-            async with semaphore:
-                return await check_single_uptime(session, w)
-                
-        async with aiohttp.ClientSession() as session:
-            tasks = [sem_task(session, w) for w in websites]
-            results = await asyncio.gather(*tasks)
-            for incidents, ping_log in results:
-                if incidents:
-                    db.add_all(incidents)
-                if ping_log:
-                    db.add(ping_log)
-            db.commit()
-    finally:
-        db.close()
-    print(f"[{datetime.utcnow()}] Uptime check completed.")
-
-async def scan_single_website(session, website):
-    scanner = AsyncWebScanner(website.url)
-    result = await scanner.run_passive_scan(session)
-    website.last_scan_result = json.dumps(result)
+    print(f"[{datetime.now(timezone.utc)}] Running 5-min uptime check...")
+    db = next(get_db())
+    websites = db.query(Website).all()
     
-    incidents = []
-    if result.get("status") == "error":
-        incidents.append(IncidentLog(website_id=website.id, incident_type="SCAN_ERROR", message=f"Error en escáner: {result.get('message')}"))
-    return incidents
+    semaphore = asyncio.Semaphore(50)
 
-async def weekly_scans():
-    print(f"[{datetime.utcnow()}] Running weekly full scan...")
-    db = SessionLocal()
-    try:
-        websites = db.query(Website).all()
-        semaphore = asyncio.Semaphore(50)
+    async def sem_check(website):
+        async with semaphore:
+            await check_single_uptime(website, db)
+
+    tasks = [sem_check(w) for w in websites]
+    if tasks:
+        await asyncio.gather(*tasks)
+    
+    print(f"[{datetime.now(timezone.utc)}] Uptime check completed.")
+
+async def scan_single_website(website, db: Session):
+    scanner = AsyncWebScanner(website.url)
+    async with aiohttp.ClientSession() as session:
+        result = await scanner.run_passive_scan(session)
+        website.last_scan_result = json.dumps(result)
         
-        async def sem_task(session, w):
-            async with semaphore:
-                return await scan_single_website(session, w)
+        ssl_valid = result.get("ssl_valid")
+        ssl_exp = result.get("ssl_expiration_date")
+        if ssl_valid is not None:
+            website.ssl_valid = ssl_valid
+        if ssl_exp is not None:
+            website.ssl_expiration_date = datetime.fromisoformat(ssl_exp)
+            days_left = (website.ssl_expiration_date - datetime.now(timezone.utc)).days
+            if 0 <= days_left <= 7 and website.alerts_enabled:
+                msg = f"El certificado SSL caduca en {days_left} días."
+                db.add(IncidentLog(website_id=website.id, incident_type="SSL_WARNING", message=msg))
+                await send_telegram_alert(f"⚠️ <b>ALERTA SSL</b>\nLa web {website.url} caduca en {days_left} días.")
                 
-        async with aiohttp.ClientSession() as session:
-            tasks = [sem_task(session, w) for w in websites]
-            results = await asyncio.gather(*tasks)
-            for incidents in results:
-                if incidents:
-                    db.add_all(incidents)
-            db.commit()
-    finally:
-        db.close()
-    print(f"[{datetime.utcnow()}] Weekly scan completed.")
+        if result.get("status") == "error":
+            db.add(IncidentLog(website_id=website.id, incident_type="SCAN_ERROR", message=f"Error en escáner: {result.get('message')}"))
+        db.commit()
+
+async def run_full_scans():
+    print(f"[{datetime.now(timezone.utc)}] Running weekly full scan...")
+    db = next(get_db())
+    websites = db.query(Website).all()
+    
+    semaphore = asyncio.Semaphore(10)
+
+    async def sem_scan(website):
+        async with semaphore:
+            await scan_single_website(website, db)
+
+    tasks = [sem_scan(w) for w in websites]
+    if tasks:
+        await asyncio.gather(*tasks)
+        
+    print(f"[{datetime.now(timezone.utc)}] Weekly scan completed.")
 
 def start_scheduler():
-    # Uptime check every 5 minutes
     scheduler.add_job(check_uptimes, 'interval', minutes=5, id='uptime_job')
-    
-    # Weekly scan on Saturday at 23:59
-    scheduler.add_job(
-        weekly_scans,
-        CronTrigger(day_of_week='sat', hour=23, minute=59),
-        id='weekly_scan_job'
-    )
-    
+    scheduler.add_job(run_full_scans, 'cron', day_of_week='sun', hour=3, id='weekly_scan_job')
     scheduler.start()

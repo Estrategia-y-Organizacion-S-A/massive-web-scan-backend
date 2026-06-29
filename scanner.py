@@ -2,6 +2,10 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 import asyncio
+import urllib.parse
+import ssl
+import socket
+from datetime import datetime, timezone
 
 class AsyncWebScanner:
     def __init__(self, url):
@@ -106,6 +110,35 @@ class AsyncWebScanner:
             audit.append("RSD Link expuesto")
         return audit
 
+    async def check_ssl_cert(self):
+        parsed = urllib.parse.urlparse(self.url)
+        hostname = parsed.hostname
+        if not hostname or parsed.scheme != 'https':
+            return False, None
+            
+        loop = asyncio.get_event_loop()
+        
+        def _get_cert():
+            context = ssl.create_default_context()
+            try:
+                with socket.create_connection((hostname, 443), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                        cert = ssock.getpeercert()
+                        return True, cert.get('notAfter')
+            except Exception:
+                return False, None
+                
+        valid, not_after = await loop.run_in_executor(None, _get_cert)
+        
+        exp_date = None
+        if valid and not_after:
+            try:
+                exp_date = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+                
+        return valid, exp_date
+
     async def run_passive_scan(self, session):
         try:
             async with session.get(self.url, headers=self.headers, timeout=45, ssl=False) as response:
@@ -120,6 +153,7 @@ class AsyncWebScanner:
                 if session.cookie_jar:
                     cookies_str = str(session.cookie_jar).lower()
                 
+                ssl_valid, ssl_exp = await self.check_ssl_cert()
                 cms = self.detect_cms(html, all_headers, cookies_str)
                 
                 return {
@@ -129,7 +163,9 @@ class AsyncWebScanner:
                     "header_issues": self.scan_headers(all_headers),
                     "ecosystem": self.analyze_ecosystem(html, cms),
                     "malware": self.analyze_html_for_malware(html),
-                    "audit": self.run_passive_audit(html)
+                    "audit": self.run_passive_audit(html),
+                    "ssl_valid": ssl_valid,
+                    "ssl_expiration_date": ssl_exp.isoformat() if ssl_exp else None
                 }
         except Exception as e:
             return {"status": "error", "target": self.url, "message": str(e)}

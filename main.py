@@ -60,9 +60,12 @@ class BatchRequest(BaseModel):
 class WebsiteResponse(BaseModel):
     id: int
     url: str
-    is_up: Optional[bool]
-    last_uptime_check: Optional[datetime]
-    last_scan_result: Optional[str]
+    is_up: Optional[bool] = None
+    last_uptime_check: Optional[datetime] = None
+    last_scan_result: Optional[str] = None
+    ssl_expiration_date: Optional[datetime] = None
+    ssl_valid: Optional[bool] = None
+    alerts_enabled: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -142,18 +145,10 @@ async def scan_website_now(website_id: int, db: Session = Depends(get_db), curre
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
         
-    async with aiohttp.ClientSession() as session:
-        uptime_incidents, ping_log = await check_single_uptime(session, website)
-        scan_incidents = await scan_single_website(session, website)
-        all_incidents = uptime_incidents + scan_incidents
-        
-        if ping_log:
-            db.add(ping_log)
-        if all_incidents:
-            db.add_all(all_incidents)
-        db.commit()
-        db.refresh(website)
-        
+    await check_single_uptime(website, db)
+    await scan_single_website(website, db)
+    
+    db.refresh(website)
     return website
 
 
@@ -165,23 +160,14 @@ async def scan_all_now(db: Session = Depends(get_db), current_user: str = Depend
 
     semaphore = asyncio.Semaphore(50)
     
-    async def sem_task(session, w):
+    async def sem_task(w):
         async with semaphore:
-            uptime_incidents, ping_log = await check_single_uptime(session, w)
-            scan_incidents = await scan_single_website(session, w)
-            
-            if ping_log:
-                db.add(ping_log)
-            return uptime_incidents + scan_incidents
+            await check_single_uptime(w, db)
+            await scan_single_website(w, db)
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [sem_task(session, w) for w in websites]
-        results = await asyncio.gather(*tasks)
-        for incidents in results:
-            if incidents:
-                db.add_all(incidents)
+    tasks = [sem_task(w) for w in websites]
+    await asyncio.gather(*tasks)
         
-    db.commit()
     return {"message": f"Scanned {len(websites)} websites"}
 
 class UpdateUrlRequest(BaseModel):
@@ -198,6 +184,17 @@ def update_website_url(website_id: int, request: UpdateUrlRequest, db: Session =
     website.is_up = None # Reset status
     website.last_uptime_check = None
     website.last_scan_result = None # Clear old scan data because URL changed
+    db.commit()
+    db.refresh(website)
+    return website
+
+@app.put("/api/websites/{website_id}/alerts", response_model=WebsiteResponse)
+def toggle_website_alerts(website_id: int, db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+    
+    website.alerts_enabled = not website.alerts_enabled
     db.commit()
     db.refresh(website)
     return website
